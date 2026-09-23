@@ -160,6 +160,7 @@ mod nmosaudiochannelmap;
 mod nmossink;
 mod nmossrc;
 mod nvdsudp;
+mod pipeline_clock;
 mod runtime;
 mod sdp;
 mod sdp_passthrough;

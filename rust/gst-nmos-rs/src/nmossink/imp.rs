@@ -34,6 +34,7 @@ use anyhow::{Context, anyhow};
 
 use crate::daemon::{ActivationHandler, ActivationOutcome, ActivationRequest, Session};
 use crate::inner;
+use crate::pipeline_clock::PipelineClock;
 use crate::session::{
     ActivationAck, ActivationPlan, CommonSettings, InnerConfig, NodeSettings, TransportConfig,
 };
@@ -58,6 +59,7 @@ struct Settings {
     registration_url: String,
     system_url: String,
     transport: Transport,
+    pipeline_clock: PipelineClock,
     sender_name: String,
     mxl_domain_id: String,
     mxl_domain_path: String,
@@ -105,6 +107,7 @@ impl Default for Settings {
             registration_url: String::new(),
             system_url: String::new(),
             transport: Transport::default(),
+            pipeline_clock: PipelineClock::default(),
             sender_name: String::new(),
             mxl_domain_id: String::new(),
             mxl_domain_path: String::new(),
@@ -192,6 +195,16 @@ impl ObjectImpl for NmosSink {
                 glib::ParamSpecEnum::builder_with_default("transport", Transport::Udp)
                     .nick("Transport")
                     .blurb(crate::session::TRANSPORT_BLURB)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecEnum::builder::<PipelineClock>("pipeline-clock")
+                    .nick("Pipeline Clock")
+                    .blurb(
+                        "Clock epoch offered by nmossink. `auto` uses the process-wide \
+                         REALTIME system clock for nvdsudp and leaves other transports \
+                         unchanged. This clock is process-wide, not element-local.",
+                    )
+                    .default_value(PipelineClock::Auto)
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("sender-name")
@@ -377,6 +390,9 @@ impl ObjectImpl for NmosSink {
             "transport" => {
                 settings.transport = value.get().expect("type checked upstream");
             }
+            "pipeline-clock" => {
+                settings.pipeline_clock = value.get().expect("type checked upstream");
+            }
             "sender-name" => {
                 settings.sender_name = string_or_empty(value);
             }
@@ -455,6 +471,7 @@ impl ObjectImpl for NmosSink {
             "registration-url" => settings.registration_url.to_value(),
             "system-url" => settings.system_url.to_value(),
             "transport" => settings.transport.to_value(),
+            "pipeline-clock" => settings.pipeline_clock.to_value(),
             "sender-name" => settings.sender_name.to_value(),
             "mxl-domain-id" => settings.mxl_domain_id.to_value(),
             "mxl-domain-path" => settings.mxl_domain_path.to_value(),
@@ -524,6 +541,17 @@ impl ElementImpl for NmosSink {
         PAD_TEMPLATES.as_ref()
     }
 
+    fn provide_clock(&self) -> Option<gst::Clock> {
+        let (policy, transport) = {
+            let settings = self.settings.lock().unwrap();
+            (settings.pipeline_clock, settings.transport)
+        };
+        match policy.resolve(transport) {
+            Some(clock_type) => Some(crate::pipeline_clock::epoch_clock(clock_type)),
+            None => self.parent_provide_clock(),
+        }
+    }
+
     fn change_state(
         &self,
         transition: gst::StateChange,
@@ -539,6 +567,7 @@ impl ElementImpl for NmosSink {
                     );
                     return Err(gst::StateChangeError);
                 }
+                self.configure_pipeline_clock();
             }
             gst::StateChange::ReadyToNull => {
                 self.close_session();
@@ -635,6 +664,27 @@ impl BinImpl for NmosSink {
 }
 
 impl NmosSink {
+    /// Configure the shared system-clock epoch before the pipeline latches its
+    /// clock and base time at PAUSED→PLAYING.
+    fn configure_pipeline_clock(&self) {
+        let (policy, transport) = {
+            let settings = self.settings.lock().unwrap();
+            (settings.pipeline_clock, settings.transport)
+        };
+        let Some(clock_type) = policy.resolve(transport) else {
+            return;
+        };
+
+        crate::pipeline_clock::epoch_clock(clock_type);
+        self.obj()
+            .set_element_flags(gst::ElementFlags::PROVIDE_CLOCK);
+        gst::info!(
+            CAT,
+            imp = self,
+            "configured process-wide system clock as {clock_type:?} for {transport:?}"
+        );
+    }
+
     // Locks `settings`; must not be called while that mutex is held.
     fn set_connection_active(&self, new_active: bool, reason: &'static str) {
         let resource_name = self.settings.lock().unwrap().sender_name.clone();
@@ -788,7 +838,11 @@ impl NmosSink {
         let ghost = ghost_guard
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("nmossink ghost pad missing"))?;
-        inner::rebuild_chain(&CAT, bin, ghost, new_inner, "sink")
+        inner::rebuild_chain(&CAT, bin, ghost, new_inner, "sink")?;
+        // GstBin derives PROVIDE_CLOCK from its children as they are swapped.
+        // Reassert the outer element's own policy for future clock selection.
+        self.configure_pipeline_clock();
+        Ok(())
     }
 
     /// True iff the bin's current inner chain is a real transport
@@ -1214,6 +1268,21 @@ mod tests {
         assert!(pspec.flags().contains(glib::ParamFlags::READABLE));
         assert!(!pspec.flags().contains(glib::ParamFlags::WRITABLE));
         assert_eq!(pspec.nick(), "Sender Active");
+    }
+
+    #[test]
+    fn pipeline_clock_defaults_auto_and_is_writable() {
+        init_gst();
+        let element = glib::Object::builder::<crate::nmossink::NmosSink>().build();
+        assert_eq!(
+            element.property::<PipelineClock>("pipeline-clock"),
+            PipelineClock::Auto
+        );
+        element.set_property("pipeline-clock", PipelineClock::Realtime);
+        assert_eq!(
+            element.property::<PipelineClock>("pipeline-clock"),
+            PipelineClock::Realtime
+        );
     }
 
     /// Pins the IS-05 Sender `transport_params` → `CommonSettings`
